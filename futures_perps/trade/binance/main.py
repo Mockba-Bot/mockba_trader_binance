@@ -324,11 +324,12 @@ def analyze_with_llm(signal_dict: dict) -> dict:
     logger.debug(f"LLM Prompt:\n{prompt[:2000]}...\n--- End of Prompt ---")
 
     # --- Send to DeepSeek ---
+    # --- Send to DeepSeek ---
     response = requests.post(
-        "https://api.deepseek.com",
+        "https://api.deepseek.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {os.getenv('DEEP_SEEK_API_KEY')}"},
         json={
-            "model": "deepseek-reasoner",
+            "model": "deepseek-chat",
             "messages": [
                 {"role": "user", "content": prompt},
                 {"role": "user", "content": f"Candles (CSV format):\n{csv_content}"},
@@ -338,8 +339,7 @@ def analyze_with_llm(signal_dict: dict) -> dict:
             ],
             "temperature": 0.0,
             "max_tokens": 500
-        },
-        timeout=45
+        }
     )
     
     if response.status_code == 200:

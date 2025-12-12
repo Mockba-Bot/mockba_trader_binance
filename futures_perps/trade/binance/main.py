@@ -12,7 +12,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
 from db.db_ops import  initialize_database_tables, get_bot_status
 from logs.log_config import binance_trader_logger as logger
 from binance.client import Client as BinanceClient
-from historical_data import get_historical_data_limit_binance, get_orderbook, get_funding_rate_history, get_public_liquidations, get_funding_rate_history, get_binance_liquidation_levels
+from historical_data import get_historical_data_limit_binance, get_orderbook, get_funding_rate_history, get_binance_liquidations, get_funding_rate_history, get_binance_liquidation_levels
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -201,7 +201,7 @@ def analyze_with_llm(signal_dict: dict) -> dict:
         funding_bias = "NEUTRO"
 
     # Get liquidations data (Binance format)
-    liquidations = get_public_liquidations(symbol=signal_dict['asset'], lookback_hours=24)
+    liquidations = get_binance_liquidations(symbol=signal_dict['asset'], lookback_hours=24)
     liquidation_levels = get_binance_liquidation_levels(symbol=signal_dict['asset'])
     
     # Analyze liquidation context

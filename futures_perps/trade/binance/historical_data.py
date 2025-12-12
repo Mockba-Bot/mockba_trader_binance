@@ -6,6 +6,7 @@ from typing import Dict, Optional
 import requests
 import pandas as pd
 import numpy as np
+from binance.client import Client
 from logs.log_config import binance_trader_logger as logger
 
 # === Binance Futures (USDT-M) Config ===
@@ -447,6 +448,34 @@ def get_public_liquidations(symbol: str = None, lookback_hours: int = 24):
     except requests.exceptions.RequestException as e:
         logger.error(f"Error fetching Binance liquidations: {e}")
         return []
+
+def get_binance_liquidations(symbol: str, lookback_hours: int = 24):
+    """
+    Fetch recent liquidations from Binance Futures using authenticated endpoint.
+    Returns list of liquidation events.
+    """
+    client = Client(
+        api_key=os.getenv("BINANCE_API_KEY"),
+        api_secret=os.getenv("BINANCE_SECRET_KEY"),
+        testnet=False
+    )
+    
+    try:
+        end_time = int(time.time() * 1000)
+        start_time = end_time - (lookback_hours * 3600 * 1000)
+        
+        # This is the ONLY correct way — uses signed request
+        liquidations = client.futures_liquidation_orders(
+            symbol=symbol,
+            startTime=start_time,
+            endTime=end_time,
+            limit=1000  # max allowed
+        )
+        return liquidations
+    except Exception as e:
+        logger.error(f"Failed to fetch Binance liquidations for {symbol}: {e}")
+        return []
+
 
 def get_binance_liquidation_levels(symbol: str):
     """

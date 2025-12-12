@@ -238,10 +238,10 @@ def place_futures_order(signal: dict):
         logger.info(f"Entry market order filled: {entry_id} @ {entry_order['avgPrice']}")
 
         # Take Profit (MARKET)
-        tp_order = client.futures_create_order(
+        tp_order = client.futures_create_algo_order(
             symbol=symbol,
-            type='TAKE_PROFIT_MARKET',
             side=close_side,
+            type='TAKE_PROFIT_MARKET',
             stopPrice=tp_price,
             positionSide='BOTH',
             workingType='MARK_PRICE',
@@ -252,10 +252,10 @@ def place_futures_order(signal: dict):
         logger.info(f"TP placed: {tp_id}")
 
         # Stop Loss (MARKET)
-        sl_order = client.futures_create_order(
+        sl_order = client.futures_create_algo_order(
             symbol=symbol,
-            type='STOP_MARKET',
             side=close_side,
+            type='STOP_MARKET',
             stopPrice=sl_price,
             positionSide='BOTH',
             workingType='MARK_PRICE',
@@ -272,7 +272,7 @@ def place_futures_order(signal: dict):
         store_order_ids(symbol, tp_id, sl_id)
 
         # 🚨 CRITICAL: Verify position is still open (protects against instant SL/TP or API glitches)
-        time.sleep(2)  # Let Binance settle
+        time.sleep(5)  # Let Binance settle
         try:
             pos_info = client.futures_position_information(symbol=symbol)
             current_amt = float(pos_info[0]['positionAmt'])
@@ -317,14 +317,15 @@ def place_futures_order(signal: dict):
         return None
 
 def cleanup_specific_orders(symbol: str, tp_id: str, sl_id: str):
-    """Cancel specific TP/SL orders if they exist"""
-    for order_id in [tp_id, sl_id]:
+    """Cancel specific TP/SL algo orders if they exist"""
+    for algo_id in [tp_id, sl_id]:
+        if not algo_id:
+            continue
         try:
-            client.futures_cancel_order(symbol=symbol, orderId=order_id)
-            logger.info(f"Cancelled orphaned order {order_id} for {symbol}")
+            client.futures_cancel_algo_order(symbol=symbol, algoId=algo_id)
+            logger.info(f"Cancelled orphaned algo order {algo_id} for {symbol}")
         except Exception as e:
-            # Order may not exist — that's OK
-            pass    
+            logger.debug(f"Algo order {algo_id} not found or already gone: {e}")
 
 def get_position_key(symbol: str) -> str:
     return f"binance_position:{symbol}"
@@ -351,42 +352,34 @@ def clear_order_ids(symbol: str):
         redis_client.delete(get_position_key(symbol))
 
 def cancel_orphaned_orders_for_symbol(symbol: str):
-    """Cancel TP/SL if position is closed but orders remain"""
     try:
-        # Check current position
         pos_info = client.futures_position_information(symbol=symbol)
-        
-        # FIX: Check if we got any position data for this symbol
         if not pos_info:
-            # logger.debug(f"No position information found for {symbol}")
             return
             
         position_amt = float(pos_info[0]['positionAmt'])
-        
-        # If position is closed (zero size)
-        if position_amt == 0:
-            order_ids = load_order_ids(symbol)
-            if not order_ids:
-                return
+        if position_amt != 0:  # Only clean if position is CLOSED
+            return
 
-            tp_id = order_ids.get("tp_id")
-            sl_id = order_ids.get("sl_id")
+        order_ids = load_order_ids(symbol)
+        if not order_ids:
+            return
 
-            # Cancel any remaining TP/SL
-            for order_type, order_id in [("TP", tp_id), ("SL", sl_id)]:
-                if order_id:
-                    try:
-                        client.futures_cancel_order(symbol=symbol, orderId=order_id)
-                        logger.info(f"✅ Cancelled orphaned {order_type} order {order_id} for {symbol}")
-                    except Exception as e:
-                        # Order may already be filled/cancelled — that's OK
-                        logger.debug(f"Orphaned {order_type} order not found: {e}")
+        tp_id = order_ids.get("tp_id")
+        sl_id = order_ids.get("sl_id")
 
-            # Clean up Redis
-            clear_order_ids(symbol)
+        for algo_id in [tp_id, sl_id]:
+            if algo_id:
+                try:
+                    client.futures_cancel_algo_order(symbol=symbol, algoId=algo_id)
+                    logger.info(f"✅ Cancelled orphaned algo order {algo_id} for {symbol}")
+                except Exception as e:
+                    logger.debug(f"Orphan algo {algo_id} not found: {e}")
+
+        clear_order_ids(symbol)
 
     except Exception as e:
-        logger.error(f"Error checking/canceling orphans for {symbol}: {e}")
+        logger.error(f"Error in cancel_orphaned_orders_for_symbol({symbol}): {e}")
 
 
 
@@ -407,24 +400,22 @@ def cleanup_all_orphaned_orders():
 
 
 def recover_order_state_on_startup():
-    """On startup, scan Binance for open positions + TP/SL orders, rebuild Redis"""
     try:
         positions = client.futures_position_information()
         for pos in positions:
             symbol = pos['symbol']
             amt = float(pos['positionAmt'])
-            if amt != 0:  # Active position
-                # Find associated TP/SL orders
+            if amt != 0:
                 open_orders = client.futures_get_open_orders(symbol=symbol)
                 tp_id = None
                 sl_id = None
                 for order in open_orders:
-                    if order['type'] == 'TAKE_PROFIT_MARKET':
-                        tp_id = order['orderId']
-                    elif order['type'] == 'STOP_MARKET':
-                        sl_id = order['orderId']
+                    # Algo orders have 'type' and 'algoId'
+                    if order.get('type') == 'TAKE_PROFIT_MARKET':
+                        tp_id = order.get('algoId')  # ✅ NOT orderId
+                    elif order.get('type') == 'STOP_MARKET':
+                        sl_id = order.get('algoId')  # ✅
                 
-                # Only store if at least one TP/SL exists
                 if tp_id or sl_id:
                     store_order_ids(symbol, tp_id or "", sl_id or "")
                     logger.info(f"🔁 Recovered state for {symbol}: TP={tp_id}, SL={sl_id}")

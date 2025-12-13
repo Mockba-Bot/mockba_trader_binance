@@ -109,51 +109,46 @@ def round_step_size(quantity: float, step_size: float) -> float:
     return round(quantity - (quantity % step_size), precision)
 
 def calculate_position_size_with_margin_cap(signal: dict, available_balance: float, leverage: int, symbol_info: dict) -> float:
-    """
-    Calculate position size based on:
-    1. Risk amount = balance * RISK_PER_TRADE_PCT / |entry - SL|
-    2. Cap by max affordable notional = balance * leverage * 0.95
-    """
     entry = float(signal['entry'])
     sl = float(signal['stop_loss'])
     side = signal['side'].upper()
 
+    # ---- 1. Risk-based position size (primary control) ----
     risk_amount = available_balance * (RISK_PER_TRADE_PCT / 100)
     risk_per_unit = abs(entry - sl)
 
-    if risk_per_unit <= 0:
-        logger.warning("Invalid stop loss placement")
+    if risk_per_unit < 1e-10:
+        logger.warning("Stop loss too close to entry")
         return 0.0
 
-    # Prevent division by zero
-    if risk_per_unit < 1e-10:  # Very small risk per unit
-        logger.warning("Risk per unit too small, skipping trade")
-        return 0.0
+    qty_risk_based = risk_amount / risk_per_unit
 
-    qty_by_risk = risk_amount / risk_per_unit
+    # ---- 2. Maximum affordable notional (hard limit) ----
+    # Full margin = balance * leverage, but leave ~5% buffer for fees/slippage
+    max_affordable_notional = available_balance * leverage * 0.95
+    max_qty_by_margin = max_affordable_notional / entry
 
-    # Margin-based cap - SAFER
-    max_notional = available_balance * leverage * 0.5  # 50% of available margin (was 75%)
-    
-    # Prevent division by zero for entry price
-    if entry <= 0:
-        logger.warning("Invalid entry price")
-        return 0.0
-        
-    qty_by_margin = max_notional / entry
+    # ---- 3. Final qty = risk-based, but never exceed margin limit ----
+    qty = min(qty_risk_based, max_qty_by_margin)
 
-    qty = min(qty_by_risk, qty_by_margin)
-
-    # Round and validate
+    # ---- 4. Round and validate against exchange rules ----
     qty = round_step_size(qty, symbol_info['stepSize'])
+
     if qty < symbol_info['minQty']:
-        logger.warning(f"Qty {qty} below minQty {symbol_info['minQty']}")
+        logger.warning(f"Qty {qty} below minQty {symbol_info['minQty']} for {signal['symbol']}")
         return 0.0
 
     notional = qty * entry
-    if notional < symbol_info['minNotional']:
-        logger.warning(f"Notional ${notional:.2f} below min ${symbol_info['minNotional']}")
+    min_notional = symbol_info.get('minNotional', 5.0)
+    if notional < min_notional:
+        logger.warning(f"Notional ${notional:.2f} below min ${min_notional}")
         return 0.0
+
+    # Optional: log why sizing was chosen
+    if qty == qty_risk_based:
+        logger.info(f"Position sized by risk: {qty:.6f}")
+    else:
+        logger.warning(f"Position capped by margin: risk wanted {qty_risk_based:.6f}, got {qty:.6f}")
 
     return qty
 
@@ -238,29 +233,27 @@ def place_futures_order(signal: dict):
         logger.info(f"Entry market order filled: {entry_id} @ {entry_order['avgPrice']}")
 
         # Take Profit (MARKET)
-        tp_order = client.futures_create_algo_order(
+        tp_order = client.futures_create_order(
             symbol=symbol,
             side=close_side,
             type='TAKE_PROFIT_MARKET',
             stopPrice=tp_price,
-            positionSide='BOTH',
-            workingType='MARK_PRICE',
             closePosition=True,
-            priceProtect=True
+            workingType='MARK_PRICE',
+            priceProtect='TRUE'
         )
         tp_id = tp_order['orderId']
         logger.info(f"TP placed: {tp_id}")
 
         # Stop Loss (MARKET)
-        sl_order = client.futures_create_algo_order(
+        sl_order = client.futures_create_order(
             symbol=symbol,
             side=close_side,
             type='STOP_MARKET',
             stopPrice=sl_price,
-            positionSide='BOTH',
-            workingType='MARK_PRICE',
             closePosition=True,
-            priceProtect=True
+            workingType='MARK_PRICE',
+            priceProtect='TRUE'
         )
         sl_id = sl_order['orderId']
         logger.info(f"SL placed: {sl_id}")

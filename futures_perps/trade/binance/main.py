@@ -447,12 +447,7 @@ def process_signal():
             
             # Must have positive expectancy and enough trades
             if bt.get("trades", 0) < 15 or bt.get("exp", 0.0) <= MICRO_BACKTEST_MIN_EXPECTANCY:
-                logger.info(f"❌ {signal['asset']} micro-backtest failed: {bt}")
-                # Message to indicate why th ebacktest failed
-                message = f"❌ {signal['asset']} micro-backtest failed:\n"
-                message += f"- Trades: {bt.get('trades', 0)} (min 15)\n"
-                message += f"- Expectancy: {bt.get('exp', 0.0):.4f} (min {MICRO_BACKTEST_MIN_EXPECTANCY})\n"
-                # send_bot_message(int(os.getenv("TELEGRAM_CHAT_ID")), message)
+                logger.info(f"❌ {signal['asset']} micro-backtest not passed: {bt}, min Expectancy: {MICRO_BACKTEST_MIN_EXPECTANCY}")
                 time.sleep(30)
                 continue
             

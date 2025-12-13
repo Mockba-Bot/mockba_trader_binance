@@ -1,7 +1,7 @@
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-from time import time
+import time
 from typing import Dict, Optional
 import requests
 import pandas as pd
@@ -405,7 +405,7 @@ def get_public_liquidations(symbol: str = None, lookback_hours: int = 24):
     # Method 1: Get forced orders (partial liquidation data)
     url = "https://fapi.binance.com/fapi/v1/forceOrders"
     
-    end_time = int(time() * 1000)
+    end_time = int(time.time() * 1000)
     start_time = end_time - (lookback_hours * 3600 * 1000)
     
     params = {
@@ -499,7 +499,7 @@ def get_binance_liquidation_levels(symbol: str):
             'symbol': symbol,
             'open_interest': float(oi_data.get('openInterest', 0)),
             'mark_price': float(premium_data.get('markPrice', 0)),
-            'timestamp': int(time() * 1000)
+            'timestamp': int(time.time() * 1000)
         }
         
     except requests.exceptions.RequestException as e:
@@ -512,9 +512,9 @@ def get_binance_liquidation_levels(symbol: str):
 # #   print(data)
 #     # orderbook = get_orderbook("BTCUSDT", limit=5)
 #     # print(orderbook)
-#     data = get_public_liquidations("BTCUSDT", lookback_hours=24)
+#     data = get_public_liquidations("LINKUSDT", lookback_hours=24)
 #     print(data)
-#     data1 = get_binance_liquidation_levels("BTCUSDT")
-#     print(data1)
-#     funding_history = get_funding_rate_history("BTCUSDT", limit=50)
-#     print(funding_history)
+#     # data1 = get_binance_liquidation_levels("BTCUSDT")
+#     # print(data1)
+#     # funding_history = get_funding_rate_history("BTCUSDT", limit=50)
+#     # print(funding_history)

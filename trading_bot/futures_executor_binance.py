@@ -109,46 +109,51 @@ def round_step_size(quantity: float, step_size: float) -> float:
     return round(quantity - (quantity % step_size), precision)
 
 def calculate_position_size_with_margin_cap(signal: dict, available_balance: float, leverage: int, symbol_info: dict) -> float:
+    """
+    Calculate position size based on:
+    1. Risk amount = balance * RISK_PER_TRADE_PCT / |entry - SL|
+    2. Cap by max affordable notional = balance * leverage * 0.95
+    """
     entry = float(signal['entry'])
     sl = float(signal['stop_loss'])
     side = signal['side'].upper()
 
-    # ---- 1. Risk-based position size (primary control) ----
     risk_amount = available_balance * (RISK_PER_TRADE_PCT / 100)
     risk_per_unit = abs(entry - sl)
 
-    if risk_per_unit < 1e-10:
-        logger.warning("Stop loss too close to entry")
+    if risk_per_unit <= 0:
+        logger.warning("Invalid stop loss placement")
         return 0.0
 
-    qty_risk_based = risk_amount / risk_per_unit
+    # Prevent division by zero
+    if risk_per_unit < 1e-10:  # Very small risk per unit
+        logger.warning("Risk per unit too small, skipping trade")
+        return 0.0
 
-    # ---- 2. Maximum affordable notional (hard limit) ----
-    # Full margin = balance * leverage, but leave ~5% buffer for fees/slippage
-    max_affordable_notional = available_balance * leverage * 0.95
-    max_qty_by_margin = max_affordable_notional / entry
+    qty_by_risk = risk_amount / risk_per_unit
 
-    # ---- 3. Final qty = risk-based, but never exceed margin limit ----
-    qty = min(qty_risk_based, max_qty_by_margin)
+    # Margin-based cap - SAFER
+    max_notional = available_balance * leverage * 0.5  # 50% of available margin (was 75%)
+    
+    # Prevent division by zero for entry price
+    if entry <= 0:
+        logger.warning("Invalid entry price")
+        return 0.0
+        
+    qty_by_margin = max_notional / entry
 
-    # ---- 4. Round and validate against exchange rules ----
+    qty = min(qty_by_risk, qty_by_margin)
+
+    # Round and validate
     qty = round_step_size(qty, symbol_info['stepSize'])
-
     if qty < symbol_info['minQty']:
-        logger.warning(f"Qty {qty} below minQty {symbol_info['minQty']} for {signal['symbol']}")
+        logger.warning(f"Qty {qty} below minQty {symbol_info['minQty']}")
         return 0.0
 
     notional = qty * entry
-    min_notional = symbol_info.get('minNotional', 5.0)
-    if notional < min_notional:
-        logger.warning(f"Notional ${notional:.2f} below min ${min_notional}")
+    if notional < symbol_info['minNotional']:
+        logger.warning(f"Notional ${notional:.2f} below min ${symbol_info['minNotional']}")
         return 0.0
-
-    # Optional: log why sizing was chosen
-    if qty == qty_risk_based:
-        logger.info(f"Position sized by risk: {qty:.6f}")
-    else:
-        logger.warning(f"Position capped by margin: risk wanted {qty_risk_based:.6f}, got {qty:.6f}")
 
     return qty
 
@@ -168,11 +173,10 @@ def place_futures_order(signal: dict):
         return None
 
     available_balance = get_available_balance()
-    if available_balance <= 15.0:  # Minimum $15 balance required (was $10)
+    if available_balance <= 15.0:
         logger.error(f"Insufficient balance: ${available_balance:.2f}")
         return None
 
-    # ✅ Use margin-aware position sizing
     qty = calculate_position_size_with_margin_cap(signal, available_balance, leverage, info)
     if qty <= 0:
         logger.warning(f"Position size calculation failed for {symbol}")
@@ -181,10 +185,10 @@ def place_futures_order(signal: dict):
     entry_price = float(signal['entry'])
     notional = qty * entry_price
 
-    # Check if notional is reasonable for scalping
-    max_safe_notional = available_balance * leverage * 0.5  # Match the margin cap from position sizing
-    if notional < 15 or notional > max_safe_notional:
-        logger.warning(f"Notional ${notional:.2f} outside safe range for {symbol} (max: ${max_safe_notional:.2f})")
+    # Optional: You can relax or remove this if using 95% margin cap
+    max_safe_notional = available_balance * leverage * 0.95
+    if notional < 10 or notional > max_safe_notional:
+        logger.warning(f"Notional ${notional:.2f} outside safe range (max: ${max_safe_notional:.2f})")
         return None
 
     set_leverage(symbol, leverage)
@@ -192,36 +196,34 @@ def place_futures_order(signal: dict):
     order_side = SIDE_BUY if side == 'BUY' else SIDE_SELL
     close_side = SIDE_SELL if side == 'BUY' else SIDE_BUY
 
-    # Round prices
+    # Round prices to exchange precision
     entry_price = round(entry_price, info['pricePrecision'])
     tp_price = round(float(signal['take_profit']), info['pricePrecision'])
     sl_price = round(float(signal['stop_loss']), info['pricePrecision'])
 
-    # SAFETY CHECK: Ensure TP and SL are valid
+    # Validate TP/SL logic
     if side == 'BUY':
         if tp_price <= entry_price or sl_price >= entry_price:
             logger.warning(f"Invalid TP/SL for BUY: TP={tp_price}, Entry={entry_price}, SL={sl_price}")
             return None
-    else:  # SELL
+    else:
         if tp_price >= entry_price or sl_price <= entry_price:
             logger.warning(f"Invalid TP/SL for SELL: TP={tp_price}, Entry={entry_price}, SL={sl_price}")
             return None
 
     try:
-        # ✅ Use MARKET order for immediate execution - BUT with safety
-        logger.info(f"Placing MARKET {side} for {symbol} | Qty: {qty} | Leverage: {leverage}x | Notional: ${notional:.2f}")
-        
-        # First, check if position already exists (safety check)
+        # Check for existing position
         try:
-            position_info = client.futures_position_information(symbol=symbol)
-            for pos in position_info:
+            pos_info = client.futures_position_information(symbol=symbol)
+            for pos in pos_info:
                 if float(pos['positionAmt']) != 0:
-                    logger.warning(f"Position already exists for {symbol}, skipping order")
+                    logger.warning(f"Position already exists for {symbol}, skipping")
                     return None
-        except:
-            pass  # Continue if we can't check existing positions
+        except Exception as e:
+            logger.debug(f"Could not check existing position: {e}")
 
-        # Place entry order (MARKET for immediate execution)
+        # 🔸 PLACE ENTRY ORDER (MARKET)
+        logger.info(f"Placing MARKET {side} for {symbol} | Qty: {qty} | Leverage: {leverage}x | Notional: ${notional:.2f}")
         entry_order = client.futures_create_order(
             symbol=symbol,
             type=ORDER_TYPE_MARKET,
@@ -230,22 +232,23 @@ def place_futures_order(signal: dict):
             positionSide='BOTH'
         )
         entry_id = entry_order['orderId']
-        logger.info(f"Entry market order filled: {entry_id} @ {entry_order['avgPrice']}")
+        filled_price = float(entry_order.get('avgPrice') or entry_order.get('price') or entry_price)
+        logger.info(f"Entry filled: {entry_id} @ {filled_price}")
 
-        # Take Profit (MARKET)
+        # 🔸 PLACE TAKE PROFIT (MARKET) — using futures_create_order, NOT algo
         tp_order = client.futures_create_order(
             symbol=symbol,
             side=close_side,
             type='TAKE_PROFIT_MARKET',
-            stopPrice=tp_price,
+            stopPrice=tp_price,        # Trigger price
             closePosition=True,
             workingType='MARK_PRICE',
-            priceProtect='TRUE'
+            priceProtect='TRUE'        # ← STRING 'TRUE', not boolean
         )
         tp_id = tp_order['orderId']
-        logger.info(f"TP placed: {tp_id}")
+        logger.info(f"TP order placed: {tp_id}")
 
-        # Stop Loss (MARKET)
+        # 🔸 PLACE STOP LOSS (MARKET)
         sl_order = client.futures_create_order(
             symbol=symbol,
             side=close_side,
@@ -256,69 +259,67 @@ def place_futures_order(signal: dict):
             priceProtect='TRUE'
         )
         sl_id = sl_order['orderId']
-        logger.info(f"SL placed: {sl_id}")
-
+        logger.info(f"SL order placed: {sl_id}")
 
         logger.info(f"✅ FULL POSITION OPENED: {symbol} | {side} | Qty: {qty} | Notional: ${notional:.2f}")
 
-        # ✅ STORE ORDER IDs in Redis
         store_order_ids(symbol, tp_id, sl_id)
 
-        # 🚨 CRITICAL: Verify position is still open (protects against instant SL/TP or API glitches)
-        time.sleep(5)  # Let Binance settle
+        # Verify position still open
+        time.sleep(5)
         try:
             pos_info = client.futures_position_information(symbol=symbol)
             current_amt = float(pos_info[0]['positionAmt'])
             if current_amt == 0:
-                logger.warning(f"Position closed immediately after opening for {symbol}. Cleaning up TP/SL...")
-                cleanup_specific_orders(symbol, tp_id, sl_id)  # ← you'll define this
+                logger.warning(f"Position closed immediately. Cleaning up TP/SL...")
+                cleanup_specific_orders(symbol, tp_id, sl_id)
                 return None
         except Exception as e:
             logger.error(f"Failed to verify position: {e}")
 
-        # Build the message for the bot
+        # Telegram message
         confirmation_msg = (
             f"🚨 BINANCE - Scalp Signal Detected!\n"
             f"✅ POSITION OPENED\n"
             f"Symbol: {symbol}\n"
-            f"Side: {signal['side'].upper()}\n"
+            f"Side: {side}\n"
             f"Qty: {qty:.6f}\n"
-            f"Entry: {signal['entry']:.4f}\n"
-            f"TP: {signal['take_profit']:.4f} (MARKET)\n"
-            f"SL: {signal['stop_loss']:.4f} (MARKET)\n"
+            f"Entry: {filled_price:.4f}\n"
+            f"TP: {tp_price:.4f} (MARKET)\n"
+            f"SL: {sl_price:.4f} (MARKET)\n"
             f"Notional: ${notional:.2f}\n"
             f"Leverage: {leverage}x\n"
             f"Risk: {RISK_PER_TRADE_PCT}% of balance\n"
-            f"⚠️ Auto-closing on TP/SL hit"
-            f"ℹ️ If position closes but orders remain, cancel them manually in Binance"
+            f"⚠️ Auto-closes on TP/SL hit\n"
+            f"ℹ️ Cancel orphan orders manually if needed"
         )
         send_bot_message(int(os.getenv("TELEGRAM_CHAT_ID")), confirmation_msg)
 
+        return entry_id
 
     except BinanceAPIException as e:
-        err_msg = str(e)
-        logger.error(f"Error placing orders for {symbol}: {err_msg}")
+        logger.error(f"Binance API error for {symbol}: {e.message} (code {e.code})")
         if e.code == -2019:
-            logger.warning(f"Margin insufficient. Balance=${available_balance:.2f}, Notional=${notional:.2f}, Leverage={leverage}x")
+            logger.error("Insufficient margin")
+        elif e.code == -4120:
+            logger.error("Order type not supported — likely used wrong endpoint for TP/SL")
         elif e.code == -1111:
-            logger.warning(f"Precision error for {symbol}")
-        elif e.code == -2022:
-            logger.warning(f"Reduce only error for {symbol}")
+            logger.error("Precision/step size error")
         return None
     except Exception as e:
         logger.error(f"Unexpected error placing orders for {symbol}: {e}")
         return None
 
 def cleanup_specific_orders(symbol: str, tp_id: str, sl_id: str):
-    """Cancel specific TP/SL algo orders if they exist"""
-    for algo_id in [tp_id, sl_id]:
-        if not algo_id:
+    """Cancel TP/SL orders (they are regular conditional orders, not algo orders)"""
+    for order_id in [tp_id, sl_id]:
+        if not order_id:
             continue
         try:
-            client.futures_cancel_algo_order(symbol=symbol, algoId=algo_id)
-            logger.info(f"Cancelled orphaned algo order {algo_id} for {symbol}")
+            client.futures_cancel_order(symbol=symbol, orderId=order_id)
+            logger.info(f"Cancelled orphaned order {order_id} for {symbol}")
         except Exception as e:
-            logger.debug(f"Algo order {algo_id} not found or already gone: {e}")
+            logger.debug(f"Order {order_id} not found or already gone: {e}")
 
 def get_position_key(symbol: str) -> str:
     return f"binance_position:{symbol}"

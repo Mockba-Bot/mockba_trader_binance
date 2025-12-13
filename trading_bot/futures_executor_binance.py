@@ -243,7 +243,8 @@ def place_futures_order(signal: dict):
             stopPrice=tp_price,        # Trigger price
             closePosition=True,
             workingType='MARK_PRICE',
-            priceProtect='TRUE'        # ← STRING 'TRUE', not boolean
+            priceProtect=True,         # Boolean
+            positionSide='BOTH'
         )
         tp_id = tp_order['orderId']
         logger.info(f"TP order placed: {tp_id}")
@@ -256,7 +257,8 @@ def place_futures_order(signal: dict):
             stopPrice=sl_price,
             closePosition=True,
             workingType='MARK_PRICE',
-            priceProtect='TRUE'
+            priceProtect=True,
+            positionSide='BOTH'
         )
         sl_id = sl_order['orderId']
         logger.info(f"SL order placed: {sl_id}")

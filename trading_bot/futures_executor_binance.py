@@ -39,7 +39,7 @@ else:
     redis_client = None
 
 # Risk parameters - SAFER VALUES
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.3"))  # Reduced to 0.3%
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT"))  # Reduced to 0.3%
 
 
 def get_confidence_level(confidence: float) -> str:

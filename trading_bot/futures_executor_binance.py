@@ -371,7 +371,7 @@ def place_futures_order(signal: dict):
         store_trade_in_redis(symbol, trade_data)
 
         confirmation_msg = (
-            f"🚨 BINANCE - Scalp Signal Detected!\n"
+            f"🚨 BINANCE - Signal Detected!\n"
             f"✅ POSITION OPENED\n"
             f"Symbol: {symbol}\n"
             f"Side: {side}\n"

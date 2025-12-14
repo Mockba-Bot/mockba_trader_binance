@@ -442,29 +442,29 @@ def process_signal():
             # --- MICRO BACKTEST CHECK ---
             bt = signal.get('backtest', {})
             
-            # # Must have positive expectancy and enough trades
-            # if bt.get("trades", 0) < 15 or bt.get("exp", 0.0) <= MICRO_BACKTEST_MIN_EXPECTANCY:
-            #     logger.info(f"❌ {signal['asset']} micro-backtest not passed: {bt}, min Expectancy: {MICRO_BACKTEST_MIN_EXPECTANCY}")
-            #     time.sleep(30)
-            #     continue
+            # Must have positive expectancy and enough trades
+            if bt.get("trades", 0) < 15 or bt.get("exp", 0.0) <= MICRO_BACKTEST_MIN_EXPECTANCY:
+                logger.info(f"❌ {signal['asset']} micro-backtest not passed: {bt}, min Expectancy: {MICRO_BACKTEST_MIN_EXPECTANCY}")
+                time.sleep(30)
+                continue
             
-            # logger.info(f"✅ {signal['asset']} micro-backtest passed: {bt}")
+            logger.info(f"✅ {signal['asset']} micro-backtest passed: {bt}")
             
            
-            # # --- LIQUIDITY PERSISTENCE CHECK ---
-            # cex_check = lpm.validate_cex_consensus_for_dex_asset(signal['asset'])
-            # if cex_check["consensus"] == "NO_CEX_PAIR":
-            #     logger.info(f"🛑 {signal['asset']} CEX consensus check failed: {cex_check['reason']}")
-            #     # send_bot_message(int(os.getenv("TELEGRAM_CHAT_ID")), f"🛑 {signal['asset']} CEX consensus check failed: {cex_check['reason']}")
-            #     time.sleep(30)
-            #     continue
-            # elif cex_check["consensus"] == "LOW":
-            #     logger.info(f"❌ Skipping {signal['asset']}: LOW CEX consensus ({cex_check['reason']})")
-            #     # send_bot_message(int(os.getenv("TELEGRAM_CHAT_ID")), f"❌ Skipping {signal['asset']}: LOW CEX consensus ({cex_check['reason']})")
-            #     time.sleep(30)
-            #     continue
-            # else:
-            #     logger.info(f"✅ {signal['asset']} passed CEX consensus: {cex_check['reason']}")
+            # --- LIQUIDITY PERSISTENCE CHECK ---
+            cex_check = lpm.validate_cex_consensus_for_dex_asset(signal['asset'])
+            if cex_check["consensus"] == "NO_CEX_PAIR":
+                logger.info(f"🛑 {signal['asset']} CEX consensus check failed: {cex_check['reason']}")
+                # send_bot_message(int(os.getenv("TELEGRAM_CHAT_ID")), f"🛑 {signal['asset']} CEX consensus check failed: {cex_check['reason']}")
+                time.sleep(30)
+                continue
+            elif cex_check["consensus"] == "LOW":
+                logger.info(f"❌ Skipping {signal['asset']}: LOW CEX consensus ({cex_check['reason']})")
+                # send_bot_message(int(os.getenv("TELEGRAM_CHAT_ID")), f"❌ Skipping {signal['asset']}: LOW CEX consensus ({cex_check['reason']})")
+                time.sleep(30)
+                continue
+            else:
+                logger.info(f"✅ {signal['asset']} passed CEX consensus: {cex_check['reason']}")
             
             # Analyze with LLM
             logger.info(f"Analyzing signal for {signal['asset']} with LLM...")

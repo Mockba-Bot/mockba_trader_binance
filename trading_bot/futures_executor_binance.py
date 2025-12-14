@@ -9,10 +9,9 @@ from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 from binance.exceptions import BinanceAPIException
 import redis
 import sys
-from trading_bot.send_bot_message import send_bot_message
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+from trading_bot.send_bot_message import send_bot_message
 from logs.log_config import binance_trader_logger as logger
 
 load_dotenv()
@@ -38,12 +37,16 @@ else:
     logger.info("Redis not configured (optional caching disabled)")
     redis_client = None
 
-# Risk parameters - SAFER VALUES
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.5"))  # Reduced to 0.3%
+# Risk parameters
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.5"))
 
+# In-memory active trades and threads
+_active_trades = {}
+_monitoring_threads = {}  # {symbol: {'thread': Thread, 'stop_event': Event}}
+_lock = threading.Lock()
 
 def get_confidence_level(confidence: float) -> str:
-    if confidence >= 3.0:  # STRONGER thresholds
+    if confidence >= 3.0:
         return "🚀 VERY STRONG"
     elif confidence >= 2.0:
         return "💪 STRONG"
@@ -109,11 +112,6 @@ def round_step_size(quantity: float, step_size: float) -> float:
     return round(quantity - (quantity % step_size), precision)
 
 def calculate_position_size_with_margin_cap(signal: dict, available_balance: float, leverage: int, symbol_info: dict) -> float:
-    """
-    Calculate position size based on:
-    1. Risk amount = balance * RISK_PER_TRADE_PCT / |entry - SL|
-    2. Cap by max affordable notional = balance * leverage * 0.95
-    """
     entry = float(signal['entry'])
     sl = float(signal['stop_loss'])
     side = signal['side'].upper()
@@ -124,27 +122,18 @@ def calculate_position_size_with_margin_cap(signal: dict, available_balance: flo
     if risk_per_unit <= 0:
         logger.warning("Invalid stop loss placement")
         return 0.0
-
-    # Prevent division by zero
-    if risk_per_unit < 1e-10:  # Very small risk per unit
+    if risk_per_unit < 1e-10:
         logger.warning("Risk per unit too small, skipping trade")
         return 0.0
 
     qty_by_risk = risk_amount / risk_per_unit
-
-    # Margin-based cap - SAFER
-    max_notional = available_balance * leverage * 0.5  # 50% of available margin (was 75%)
-    
-    # Prevent division by zero for entry price
+    max_notional = available_balance * leverage * 0.99
     if entry <= 0:
         logger.warning("Invalid entry price")
         return 0.0
-        
     qty_by_margin = max_notional / entry
 
     qty = min(qty_by_risk, qty_by_margin)
-
-    # Round and validate
     qty = round_step_size(qty, symbol_info['stepSize'])
     if qty < symbol_info['minQty']:
         logger.warning(f"Qty {qty} below minQty {symbol_info['minQty']}")
@@ -156,6 +145,128 @@ def calculate_position_size_with_margin_cap(signal: dict, available_balance: flo
         return 0.0
 
     return qty
+
+def close_position_market(symbol: str, side: str, qty: float, info: dict):
+    qty = round_step_size(qty, info['stepSize'])
+    try:
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type=ORDER_TYPE_MARKET,
+            quantity=qty,
+            positionSide='BOTH'
+        )
+        logger.info(f"CloseOperation filled: {order['orderId']} for {symbol}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to close position for {symbol}: {e}")
+        return False
+
+def get_redis_trade_key(symbol: str) -> str:
+    return f"trade_monitor:{symbol}"
+
+def store_trade_in_redis(symbol: str, trade_data: dict):
+    """Store trade metadata in Redis with 24h TTL"""
+    if redis_client:
+        safe_data = {
+            'symbol': trade_data['symbol'],
+            'side': trade_data['side'],
+            'qty': trade_data['qty'],
+            'tp_price': trade_data['tp_price'],
+            'sl_price': trade_data['sl_price'],
+            'price_precision': trade_data['symbol_info']['pricePrecision'],
+            'step_size': trade_data['symbol_info']['stepSize'],
+            'min_notional': trade_data['symbol_info']['minNotional']
+        }
+        redis_client.setex(get_redis_trade_key(symbol), 86400, json.dumps(safe_data))
+
+def load_trade_from_redis(symbol: str) -> dict | None:
+    """Load trade data from Redis (for recovery)"""
+    if not redis_client:
+        return None
+    data = redis_client.get(get_redis_trade_key(symbol))
+    if data:
+        loaded = json.loads(data)
+        loaded['symbol_info'] = {
+            'pricePrecision': loaded.pop('price_precision'),
+            'stepSize': loaded.pop('step_size'),
+            'minNotional': loaded.pop('min_notional'),
+            'quantityPrecision': 0,
+            'minQty': 0.0
+        }
+        return loaded
+    return None
+
+def remove_trade_from_redis(symbol: str):
+    """Remove trade from Redis"""
+    if redis_client:
+        redis_client.delete(get_redis_trade_key(symbol))
+
+def monitor_trade(symbol: str, trade_data: dict, stop_event: threading.Event):
+    side = trade_data['side']
+    qty = trade_data['qty']
+    tp_price = trade_data['tp_price']
+    sl_price = trade_data['sl_price']
+    info = trade_data['symbol_info']
+
+    logger.info(f"Started monitor for {symbol} | TP: {tp_price}, SL: {sl_price}")
+
+    while not stop_event.is_set():
+        try:
+            mark_data = client.futures_mark_price(symbol=symbol)
+            current_price = float(mark_data['markPrice'])
+
+            should_exit = False
+            reason = ""
+
+            if side == "BUY":
+                if current_price >= tp_price:
+                    should_exit = True
+                    reason = "TP"
+                elif current_price <= sl_price:
+                    should_exit = True
+                    reason = "SL"
+            else:  # SELL
+                if current_price <= tp_price:
+                    should_exit = True
+                    reason = "TP"
+                elif current_price >= sl_price:
+                    should_exit = True
+                    reason = "SL"
+
+            if should_exit:
+                close_side = SIDE_SELL if side == "BUY" else SIDE_BUY
+                success = close_position_market(symbol, close_side, qty, info)
+                if success:
+                    logger.info(f"✅ {reason} hit for {symbol} at {current_price:.4f}")
+                    msg = (
+                        f"🚨 BINANCE - Trade Closed!\n"
+                        f"Symbol: {symbol}\n"
+                        f"Side: {side}\n"
+                        f"Close Reason: {reason}\n"
+                        f"Exit Price: {current_price:.4f}\n"
+                        f"Qty: {qty:.6f}"
+                    )
+                    send_bot_message(int(os.getenv("TELEGRAM_CHAT_ID")), msg)
+                else:
+                    logger.error(f"Failed to close {symbol} on {reason}")
+                break
+
+            for _ in range(15):
+                if stop_event.is_set():
+                    break
+                time.sleep(0.1)
+
+        except Exception as e:
+            logger.error(f"Error in monitor for {symbol}: {e}")
+            if not stop_event.is_set():
+                time.sleep(5)
+
+    with _lock:
+        _active_trades.pop(symbol, None)
+        _monitoring_threads.pop(symbol, None)
+    remove_trade_from_redis(symbol)
+    logger.info(f"Monitor cleanly stopped for {symbol}")
 
 def place_futures_order(signal: dict):
     print(signal)
@@ -184,8 +295,6 @@ def place_futures_order(signal: dict):
 
     entry_price = float(signal['entry'])
     notional = qty * entry_price
-
-    # Optional: You can relax or remove this if using 95% margin cap
     max_safe_notional = available_balance * leverage * 0.95
     if notional < 10 or notional > max_safe_notional:
         logger.warning(f"Notional ${notional:.2f} outside safe range (max: ${max_safe_notional:.2f})")
@@ -194,14 +303,11 @@ def place_futures_order(signal: dict):
     set_leverage(symbol, leverage)
 
     order_side = SIDE_BUY if side == 'BUY' else SIDE_SELL
-    close_side = SIDE_SELL if side == 'BUY' else SIDE_BUY
 
-    # Round prices to exchange precision
     entry_price = round(entry_price, info['pricePrecision'])
     tp_price = round(float(signal['take_profit']), info['pricePrecision'])
     sl_price = round(float(signal['stop_loss']), info['pricePrecision'])
 
-    # Validate TP/SL logic
     if side == 'BUY':
         if tp_price <= entry_price or sl_price >= entry_price:
             logger.warning(f"Invalid TP/SL for BUY: TP={tp_price}, Entry={entry_price}, SL={sl_price}")
@@ -212,17 +318,12 @@ def place_futures_order(signal: dict):
             return None
 
     try:
-        # Check for existing position
-        try:
-            pos_info = client.futures_position_information(symbol=symbol)
-            for pos in pos_info:
-                if float(pos['positionAmt']) != 0:
-                    logger.warning(f"Position already exists for {symbol}, skipping")
-                    return None
-        except Exception as e:
-            logger.debug(f"Could not check existing position: {e}")
+        pos_info = client.futures_position_information(symbol=symbol)
+        for pos in pos_info:
+            if float(pos['positionAmt']) != 0:
+                logger.warning(f"Position already exists for {symbol}, skipping")
+                return None
 
-        # 🔸 PLACE ENTRY ORDER (MARKET)
         logger.info(f"Placing MARKET {side} for {symbol} | Qty: {qty} | Leverage: {leverage}x | Notional: ${notional:.2f}")
         entry_order = client.futures_create_order(
             symbol=symbol,
@@ -235,51 +336,40 @@ def place_futures_order(signal: dict):
         filled_price = float(entry_order.get('avgPrice') or entry_order.get('price') or entry_price)
         logger.info(f"Entry filled: {entry_id} @ {filled_price}")
 
-        # 🔸 PLACE TAKE PROFIT (MARKET) — using futures_create_order, NOT algo
-        tp_order = client.futures_create_order(
-            symbol=symbol,
-            side=close_side,
-            type='TAKE_PROFIT_MARKET',
-            stopPrice=tp_price,        # Trigger price
-            closePosition=True,
-            workingType='MARK_PRICE',
-            priceProtect=True,         # Boolean
-            positionSide='BOTH'
+        time.sleep(3)
+
+        pos_info = client.futures_position_information(symbol=symbol)
+        current_amt = float(pos_info[0]['positionAmt'])
+        if abs(current_amt) < qty * 0.9:
+            logger.error(f"Position size mismatch. Expected ~{qty}, got {current_amt}")
+            return None
+
+        trade_data = {
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "tp_price": tp_price,
+            "sl_price": sl_price,
+            "symbol_info": info
+        }
+
+        stop_event = threading.Event()
+        monitor_thread = threading.Thread(
+            target=monitor_trade,
+            args=(symbol, trade_data, stop_event),
+            daemon=True
         )
-        tp_id = tp_order['orderId']
-        logger.info(f"TP order placed: {tp_id}")
+        monitor_thread.start()
 
-        # 🔸 PLACE STOP LOSS (MARKET)
-        sl_order = client.futures_create_order(
-            symbol=symbol,
-            side=close_side,
-            type='STOP_MARKET',
-            stopPrice=sl_price,
-            closePosition=True,
-            workingType='MARK_PRICE',
-            priceProtect=True,
-            positionSide='BOTH'
-        )
-        sl_id = sl_order['orderId']
-        logger.info(f"SL order placed: {sl_id}")
+        with _lock:
+            _active_trades[symbol] = trade_data
+            _monitoring_threads[symbol] = {
+                'thread': monitor_thread,
+                'stop_event': stop_event
+            }
 
-        logger.info(f"✅ FULL POSITION OPENED: {symbol} | {side} | Qty: {qty} | Notional: ${notional:.2f}")
+        store_trade_in_redis(symbol, trade_data)
 
-        store_order_ids(symbol, tp_id, sl_id)
-
-        # Verify position still open
-        time.sleep(5)
-        try:
-            pos_info = client.futures_position_information(symbol=symbol)
-            current_amt = float(pos_info[0]['positionAmt'])
-            if current_amt == 0:
-                logger.warning(f"Position closed immediately. Cleaning up TP/SL...")
-                cleanup_specific_orders(symbol, tp_id, sl_id)
-                return None
-        except Exception as e:
-            logger.error(f"Failed to verify position: {e}")
-
-        # Telegram message
         confirmation_msg = (
             f"🚨 BINANCE - Scalp Signal Detected!\n"
             f"✅ POSITION OPENED\n"
@@ -287,13 +377,12 @@ def place_futures_order(signal: dict):
             f"Side: {side}\n"
             f"Qty: {qty:.6f}\n"
             f"Entry: {filled_price:.4f}\n"
-            f"TP: {tp_price:.4f} (MARKET)\n"
-            f"SL: {sl_price:.4f} (MARKET)\n"
+            f"TP: {tp_price:.4f}\n"
+            f"SL: {sl_price:.4f}\n"
             f"Notional: ${notional:.2f}\n"
             f"Leverage: {leverage}x\n"
             f"Risk: {RISK_PER_TRADE_PCT}% of balance\n"
-            f"⚠️ Auto-closes on TP/SL hit\n"
-            f"ℹ️ Cancel orphan orders manually if needed"
+            f"ℹ️ Auto-close on TP/SL via price monitor"
         )
         send_bot_message(int(os.getenv("TELEGRAM_CHAT_ID")), confirmation_msg)
 
@@ -303,8 +392,6 @@ def place_futures_order(signal: dict):
         logger.error(f"Binance API error for {symbol}: {e.message} (code {e.code})")
         if e.code == -2019:
             logger.error("Insufficient margin")
-        elif e.code == -4120:
-            logger.error("Order type not supported — likely used wrong endpoint for TP/SL")
         elif e.code == -1111:
             logger.error("Precision/step size error")
         return None
@@ -312,124 +399,84 @@ def place_futures_order(signal: dict):
         logger.error(f"Unexpected error placing orders for {symbol}: {e}")
         return None
 
-def cleanup_specific_orders(symbol: str, tp_id: str, sl_id: str):
-    """Cancel TP/SL orders (they are regular conditional orders, not algo orders)"""
-    for order_id in [tp_id, sl_id]:
-        if not order_id:
-            continue
-        try:
-            client.futures_cancel_order(symbol=symbol, orderId=order_id)
-            logger.info(f"Cancelled orphaned order {order_id} for {symbol}")
-        except Exception as e:
-            logger.debug(f"Order {order_id} not found or already gone: {e}")
-
-def get_position_key(symbol: str) -> str:
-    return f"binance_position:{symbol}"
-
-def store_order_ids(symbol: str, tp_id: str, sl_id: str):
-    """Store TP/SL order IDs in Redis with 48h TTL (safety)"""
-    if redis_client:
-        redis_client.hset(
-            get_position_key(symbol),
-            mapping={"tp_id": tp_id, "sl_id": sl_id}
-        )
-        redis_client.expire(get_position_key(symbol), 172800)  # 48h
-
-def load_order_ids(symbol: str) -> dict:
-    """Load TP/SL order IDs from Redis"""
-    if redis_client:
-        data = redis_client.hgetall(get_position_key(symbol))
-        return {k.decode(): v.decode() for k, v in data.items()} if data else {}
-    return {}
-
-def clear_order_ids(symbol: str):
-    """Remove TP/SL tracking from Redis"""
-    if redis_client:
-        redis_client.delete(get_position_key(symbol))
-
-def cancel_orphaned_orders_for_symbol(symbol: str):
-    try:
-        pos_info = client.futures_position_information(symbol=symbol)
-        if not pos_info:
-            return
-            
-        position_amt = float(pos_info[0]['positionAmt'])
-        if position_amt != 0:  # Only clean if position is CLOSED
-            return
-
-        order_ids = load_order_ids(symbol)
-        if not order_ids:
-            return
-
-        tp_id = order_ids.get("tp_id")
-        sl_id = order_ids.get("sl_id")
-
-        for algo_id in [tp_id, sl_id]:
-            if algo_id:
-                try:
-                    client.futures_cancel_algo_order(symbol=symbol, algoId=algo_id)
-                    logger.info(f"✅ Cancelled orphaned algo order {algo_id} for {symbol}")
-                except Exception as e:
-                    logger.debug(f"Orphan algo {algo_id} not found: {e}")
-
-        clear_order_ids(symbol)
-
-    except Exception as e:
-        logger.error(f"Error in cancel_orphaned_orders_for_symbol({symbol}): {e}")
-
-
-
-def cleanup_all_orphaned_orders():
-    """Check all tracked symbols for orphaned orders"""
-    if not redis_client:
-        return
-
-    # Get all position keys
-    keys = redis_client.keys("binance_position:*")
-    for key in keys:
-        try:
-            symbol_bytes = key.split(b":")[-1]
-            symbol = symbol_bytes.decode()
-            cancel_orphaned_orders_for_symbol(symbol)
-        except Exception as e:
-            logger.error(f"Failed to process key {key}: {e}")
-
-
-def recover_order_state_on_startup():
-    try:
-        positions = client.futures_position_information()
-        for pos in positions:
-            symbol = pos['symbol']
-            amt = float(pos['positionAmt'])
-            if amt != 0:
-                open_orders = client.futures_get_open_orders(symbol=symbol)
-                tp_id = None
-                sl_id = None
-                for order in open_orders:
-                    # Algo orders have 'type' and 'algoId'
-                    if order.get('type') == 'TAKE_PROFIT_MARKET':
-                        tp_id = order.get('algoId')  # ✅ NOT orderId
-                    elif order.get('type') == 'STOP_MARKET':
-                        sl_id = order.get('algoId')  # ✅
-                
-                if tp_id or sl_id:
-                    store_order_ids(symbol, tp_id or "", sl_id or "")
-                    logger.info(f"🔁 Recovered state for {symbol}: TP={tp_id}, SL={sl_id}")
-                else:
-                    logger.warning(f"Active position for {symbol} but no TP/SL found")
-    except Exception as e:
-        logger.error(f"State recovery failed: {e}")
-
-def start_orphan_watcher(interval_seconds=30):
-    """Run orphan cleanup every N seconds in background"""
+def start_external_close_watcher(interval_seconds=15):
     def _watch():
         while True:
             try:
-                cleanup_all_orphaned_orders()
+                with _lock:
+                    symbols = list(_monitoring_threads.keys())
+
+                for symbol in symbols:
+                    try:
+                        pos_info = client.futures_position_information(symbol=symbol)
+                        position_amt = float(pos_info[0]['positionAmt'])
+
+                        if position_amt == 0:
+                            logger.info(f"Position for {symbol} closed externally. Stopping monitor.")
+                            with _lock:
+                                thread_info = _monitoring_threads.get(symbol)
+                                if thread_info:
+                                    thread_info['stop_event'].set()
+                    except Exception as e:
+                        logger.debug(f"External close check error for {symbol}: {e}")
+
+                time.sleep(interval_seconds)
             except Exception as e:
-                logger.error(f"Orphan watcher error: {e}")
-            time.sleep(interval_seconds)
+                logger.error(f"External close watcher error: {e}")
+                time.sleep(interval_seconds)
 
     watcher = threading.Thread(target=_watch, daemon=True)
     watcher.start()
-    logger.info(f"Orphan watcher started (every {interval_seconds}s)")        
+    logger.info(f"External close watcher started (every {interval_seconds}s)")
+
+def recover_trades_on_startup():
+    if not redis_client:
+        return
+    try:
+        keys = redis_client.keys("trade_monitor:*")
+        for key in keys:
+            symbol_bytes = key.split(b":")[-1]
+            symbol = symbol_bytes.decode()
+            trade_data = load_trade_from_redis(symbol)
+            if trade_data:
+                try:
+                    pos_info = client.futures_position_information(symbol=symbol)
+                    amt = float(pos_info[0]['positionAmt'])
+                    if amt != 0:
+                        stop_event = threading.Event()
+                        monitor_thread = threading.Thread(
+                            target=monitor_trade,
+                            args=(symbol, trade_data, stop_event),
+                            daemon=True
+                        )
+                        monitor_thread.start()
+                        with _lock:
+                            _active_trades[symbol] = trade_data
+                            _monitoring_threads[symbol] = {
+                                'thread': monitor_thread,
+                                'stop_event': stop_event
+                            }
+                        logger.info(f"🔁 Recovered monitoring for {symbol}")
+                    else:
+                        remove_trade_from_redis(symbol)
+                except Exception as e:
+                    logger.debug(f"Failed to recover {symbol}: {e}")
+                    remove_trade_from_redis(symbol)
+    except Exception as e:
+        logger.error(f"Trade recovery failed: {e}")
+
+# if __name__ == "__main__":
+#     recover_trades_on_startup()
+#     start_external_close_watcher()
+
+#     signal = {
+#         "symbol": "AAVEUSDT",
+#         "side": "SELL",
+#         "entry": 196.67,
+#         "take_profit": 190.00,
+#         "stop_loss": 198.50,
+#         "leverage": 10,
+#         "confidence_percent": 90
+#     }
+#     print(f"🧪 Testing place_futures_order for {signal['symbol']}...")
+#     place_futures_order(signal)

@@ -34,7 +34,7 @@ else:
 
 
 # Import your executor
-from trading_bot.futures_executor_binance import place_futures_order, cleanup_all_orphaned_orders, recover_order_state_on_startup, start_orphan_watcher
+from trading_bot.futures_executor_binance import place_futures_order, recover_trades_on_startup, start_external_close_watcher
 
 from trading_bot.send_bot_message import send_bot_message
 
@@ -321,7 +321,7 @@ def analyze_with_llm(signal_dict: dict) -> dict:
     prompt = intro + analysis_logic + risk_context + additional_market_context + response_format
 
     # Debug the prmopt
-    logger.debug(f"LLM Prompt:\n{prompt[:2000]}...\n--- End of Prompt ---")
+    logger.debug(f"LLM Prompt:\n{prompt[:10]}...\n--- End of Prompt ---")
 
     # --- Send to DeepSeek ---
     # --- Send to DeepSeek ---
@@ -353,9 +353,6 @@ def analyze_with_llm(signal_dict: dict) -> dict:
 def process_signal():
     while True:
         """Process incoming signal from Api bot with combined CSV + orderbook file"""
-
-        # Cleanup orphaned orders on each loop
-        cleanup_all_orphaned_orders()
 
         # Only proceed if bot is running
         if not get_bot_status():
@@ -445,29 +442,29 @@ def process_signal():
             # --- MICRO BACKTEST CHECK ---
             bt = signal.get('backtest', {})
             
-            # Must have positive expectancy and enough trades
-            if bt.get("trades", 0) < 15 or bt.get("exp", 0.0) <= MICRO_BACKTEST_MIN_EXPECTANCY:
-                logger.info(f"❌ {signal['asset']} micro-backtest not passed: {bt}, min Expectancy: {MICRO_BACKTEST_MIN_EXPECTANCY}")
-                time.sleep(30)
-                continue
+            # # Must have positive expectancy and enough trades
+            # if bt.get("trades", 0) < 15 or bt.get("exp", 0.0) <= MICRO_BACKTEST_MIN_EXPECTANCY:
+            #     logger.info(f"❌ {signal['asset']} micro-backtest not passed: {bt}, min Expectancy: {MICRO_BACKTEST_MIN_EXPECTANCY}")
+            #     time.sleep(30)
+            #     continue
             
-            logger.info(f"✅ {signal['asset']} micro-backtest passed: {bt}")
+            # logger.info(f"✅ {signal['asset']} micro-backtest passed: {bt}")
             
            
-            # --- LIQUIDITY PERSISTENCE CHECK ---
-            cex_check = lpm.validate_cex_consensus_for_dex_asset(signal['asset'])
-            if cex_check["consensus"] == "NO_CEX_PAIR":
-                logger.info(f"🛑 {signal['asset']} CEX consensus check failed: {cex_check['reason']}")
-                # send_bot_message(int(os.getenv("TELEGRAM_CHAT_ID")), f"🛑 {signal['asset']} CEX consensus check failed: {cex_check['reason']}")
-                time.sleep(30)
-                continue
-            elif cex_check["consensus"] == "LOW":
-                logger.info(f"❌ Skipping {signal['asset']}: LOW CEX consensus ({cex_check['reason']})")
-                # send_bot_message(int(os.getenv("TELEGRAM_CHAT_ID")), f"❌ Skipping {signal['asset']}: LOW CEX consensus ({cex_check['reason']})")
-                time.sleep(30)
-                continue
-            else:
-                logger.info(f"✅ {signal['asset']} passed CEX consensus: {cex_check['reason']}")
+            # # --- LIQUIDITY PERSISTENCE CHECK ---
+            # cex_check = lpm.validate_cex_consensus_for_dex_asset(signal['asset'])
+            # if cex_check["consensus"] == "NO_CEX_PAIR":
+            #     logger.info(f"🛑 {signal['asset']} CEX consensus check failed: {cex_check['reason']}")
+            #     # send_bot_message(int(os.getenv("TELEGRAM_CHAT_ID")), f"🛑 {signal['asset']} CEX consensus check failed: {cex_check['reason']}")
+            #     time.sleep(30)
+            #     continue
+            # elif cex_check["consensus"] == "LOW":
+            #     logger.info(f"❌ Skipping {signal['asset']}: LOW CEX consensus ({cex_check['reason']})")
+            #     # send_bot_message(int(os.getenv("TELEGRAM_CHAT_ID")), f"❌ Skipping {signal['asset']}: LOW CEX consensus ({cex_check['reason']})")
+            #     time.sleep(30)
+            #     continue
+            # else:
+            #     logger.info(f"✅ {signal['asset']} passed CEX consensus: {cex_check['reason']}")
             
             # Analyze with LLM
             logger.info(f"Analyzing signal for {signal['asset']} with LLM...")
@@ -520,10 +517,12 @@ if __name__ == "__main__":
     # # Check for tables
     initialize_database_tables()
 
-    # Recover the order state on startup
-    recover_order_state_on_startup()
-    # Start orphan watcher in a separate thread
-    start_orphan_watcher(interval_seconds=20)
+    # Recover trades on startup
+    recover_trades_on_startup()
+
+    # start external close watcher
+    start_external_close_watcher()
+
 
     # # Start signal processing
     process_signal()
